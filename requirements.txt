@@ -1,0 +1,30 @@
+--extra-index-url https://download.pytorch.org/whl/cu118
+
+# Core NLP
+spacy>=3.7.0
+spacy-transformers>=1.3.0
+
+# PyTorch (CUDA 11.8)
+torch==2.7.0
+# torchvision==0.21.0+cu118
+# torchaudio==2.7.0+cu118
+
+# ML Frameworks
+tensorflow
+flax
+
+# GPU support
+cupy-cuda11x
+
+# Wikidata / Wikipedia
+requests
+Wikipedia-API
+huggingface_hub
+
+# XML / HTML parsing
+bs4
+lxml
+
+# Utilities
+setuptools<82
+tqdm

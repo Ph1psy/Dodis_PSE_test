@@ -1,8 +1,10 @@
+from pathlib import Path
+
+import numpy as np
 import spacy
 from spacy.kb import InMemoryLookupKB
 from spacy.tokens import DocBin
-from pathlib import Path
-import numpy as np
+
 
 def create_mini_kb():
     BASE_PATH = Path(__file__).parent.parent.parent.absolute()
@@ -30,6 +32,7 @@ def create_mini_kb():
 
     kb.to_disk(output_kb)
     print(f"kb erfolgreich unter {output_kb} gespeichert.")
+
 
 if __name__ == "__main__":
     create_mini_kb()

@@ -8,11 +8,12 @@ Usage:
     python src/tei_to_db.py
 """
 
+import json
 import sqlite3
 import xml.etree.ElementTree as ET
-import json
-from pathlib import Path
 from collections import defaultdict
+from pathlib import Path
+
 from huggingface_hub import snapshot_download
 
 TEI_NS = "http://www.tei-c.org/ns/1.0"
@@ -85,14 +86,18 @@ if __name__ == "__main__":
     cur = conn.cursor()
 
     # Einheitliches Schema: id und data als JSON (wie im Wikidata-Skript)
-    cur.execute("DROP TABLE IF EXISTS entities") # Setzt die DB zurück für sauberen Neuaufbau
+    cur.execute(
+        "DROP TABLE IF EXISTS entities"
+    )  # Setzt die DB zurück für sauberen Neuaufbau
     cur.execute("CREATE TABLE IF NOT EXISTS entities (id TEXT PRIMARY KEY, data JSON)")
 
     insert_data = []
 
     for ref, info in entities_dict.items():
         # Aliase nach Häufigkeit sortieren
-        sorted_aliases = sorted(info["aliases"].items(), key=lambda x: x[1], reverse=True)
+        sorted_aliases = sorted(
+            info["aliases"].items(), key=lambda x: x[1], reverse=True
+        )
 
         # Der häufigste Alias wird zum Haupt-Label, alle anderen (inklusive des Haupt-Labels) in die Alias-Liste
         main_label = sorted_aliases[0][0] if sorted_aliases else ""
@@ -104,22 +109,19 @@ if __name__ == "__main__":
             "labels": {
                 "de": main_label  # "de" als Standard-Sprachkey für Einheitlichkeit
             },
-            "aliases": {
-                "de": all_aliases_list
-            },
-            "type": info["type"], # Behält PER, LOC oder ORG zur leichteren Filterung
+            "aliases": {"de": all_aliases_list},
+            "type": info["type"],  # Behält PER, LOC oder ORG zur leichteren Filterung
             "claims": {
-                "P31": [info["type"]] # Fake-Claim, um die Struktur exact von Wikidata zu imitieren
-            }
+                "P31": [
+                    info["type"]
+                ]  # Fake-Claim, um die Struktur exact von Wikidata zu imitieren
+            },
         }
 
         insert_data.append((ref, json.dumps(json_obj)))
 
     # Bulk-Insert in die Datenbank
-    cur.executemany(
-        "INSERT INTO entities (id, data) VALUES (?, ?)",
-        insert_data
-    )
+    cur.executemany("INSERT INTO entities (id, data) VALUES (?, ?)", insert_data)
 
     conn.commit()
 
@@ -127,4 +129,6 @@ if __name__ == "__main__":
     assert entity_count > 0, "Keine Entities in der Datenbank"
 
     conn.close()
-    print(f"{entity_count} Entities erfolgreich im einheitlichen JSON-Format unter {DB_PATH} gespeichert.")
+    print(
+        f"{entity_count} Entities erfolgreich im einheitlichen JSON-Format unter {DB_PATH} gespeichert."
+    )

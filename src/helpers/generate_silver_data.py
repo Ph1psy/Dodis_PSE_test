@@ -1,13 +1,14 @@
-import sqlite3
 import json
-import spacy
-from spacy.tokens import DocBin, Doc
+import sqlite3
 from pathlib import Path
+
+import spacy
+from spacy.tokens import Doc, DocBin
 
 
 def get_value(entry):
     if isinstance(entry, dict):
-        return entry.get('value')
+        return entry.get("value")
     return entry
 
 
@@ -32,10 +33,10 @@ def generate():
     for qid, raw_json in cur:
         data = json.loads(raw_json)
 
-        labels_de = data.get('labels', {}).get('de', {})
+        labels_de = data.get("labels", {}).get("de", {})
         label = get_value(labels_de)
 
-        aliases_list = data.get('aliases', {}).get('de', [])
+        aliases_list = data.get("aliases", {}).get("de", [])
 
         if label and aliases_list:
             alias_text = get_value(aliases_list[0])
