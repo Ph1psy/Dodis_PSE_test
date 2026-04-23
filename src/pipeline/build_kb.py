@@ -1,113 +1,126 @@
 import argparse
-import gc
 import json
 import os
 import sqlite3
-from pathlib import Path
 
 import spacy
 from spacy.kb import InMemoryLookupKB
 
+# Für lokales Testen: Limit auf eine kleine Anzahl Entities setzen.
+# Auf None setzen für vollständiges Training (z.B. auf Ubelix).
+LOCAL_TEST_LIMIT = 10000
 
-def build_kb(database, outputPath):
 
-    DB_PATH = database
-    KB_OUTPUT_PATH = outputPath
+def get_label(data, qid):
+    """Gibt den besten verfügbaren Label-String für eine Entity zurück."""
+    labels = data.get("labels", {})
+    for lang in ["de", "en"]:
+        label = labels.get(lang)
+        if isinstance(label, dict):
+            label = label.get("value")
+        if isinstance(label, str) and label.strip():
+            return label
+    return qid  # Fallback auf Q-ID falls kein Label vorhanden
 
-    assert DB_PATH is not None, "DB_PATH ist None!"
-    assert KB_OUTPUT_PATH is not None, "KB_OUTPUT_PATH ist None!"
+
+def compute_vector(nlp, text):
+    """
+    Berechnet einen 768-dimensionalen Vektor für einen Text via BERT-Transformer.
+    Gibt einen Nullvektor zurück falls die Berechnung fehlschlägt.
+    """
+    try:
+        doc = nlp.make_doc(text[:512])  # BERT-Limit beachten
+        nlp.get_pipe("transformer")(doc)
+        if doc._.trf_data is not None and doc._.trf_data.tensors:
+            # Letztes Transformer-Layer, erste Token-Sequenz, Mittelwert über alle Tokens
+            vector = doc._.trf_data.tensors[-1][0].mean(axis=0).tolist()
+            return vector
+    except Exception:
+        pass
+    return [0.0] * 768
+
+
+def build_kb(database, output_path, limit=None):
+
+    assert database is not None, "DB_PATH ist None!"
+    assert output_path is not None, "KB_OUTPUT_PATH ist None!"
     assert isinstance(
-        DB_PATH, str
-    ), f"DB_PATH muss ein String sein, ist aber: {type(DB_PATH)}"
+        database, str
+    ), f"DB_PATH muss ein String sein, ist aber: {type(database)}"
     assert isinstance(
-        KB_OUTPUT_PATH, str
-    ), f"KB_OUTPUT_PATH muss ein String sein, ist aber: {type(KB_OUTPUT_PATH)}"
-    assert os.path.isfile(DB_PATH), f"Datenbankdatei nicht gefunden: {DB_PATH}"
+        output_path, str
+    ), f"KB_OUTPUT_PATH muss ein String sein, ist aber: {type(output_path)}"
+    assert os.path.isfile(database), f"Datenbankdatei nicht gefunden: {database}"
 
-    print(DB_PATH)
-    print(KB_OUTPUT_PATH)
+    print(f"Datenbank:   {database}")
+    print(f"Ausgabe:     {output_path}")
+    if limit is not None:
+        print(f"Test-Limit:  {limit:,} Entities (LOCAL_TEST_LIMIT aktiv)")
+    else:
+        print("Limit:       Keins – vollständiger Durchlauf")
 
+    # Modell laden
+    print("\nLade spaCy-Modell (de_dep_news_trf)...")
     nlp = spacy.load("de_dep_news_trf")
     assert nlp is not None, "spaCy-Modell konnte nicht geladen werden!"
-    assert nlp.vocab is not None, "nlp.vocab ist None!"
 
     kb = InMemoryLookupKB(vocab=nlp.vocab, entity_vector_length=768)
     assert kb is not None, "KnowledgeBase konnte nicht erstellt werden!"
 
-    conn = sqlite3.connect(DB_PATH)
-    assert conn is not None, "Datenbankverbindung ist None!"
-
+    # Datenbankverbindung
+    conn = sqlite3.connect(database)
     cur = conn.cursor()
-    assert cur is not None, "Datenbank-Cursor ist None!"
 
-    # Sicherstellen dass die Tabelle existiert und Daten enthält
     cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='entities'")
-    table_check = cur.fetchone()
     assert (
-        table_check is not None
+        cur.fetchone() is not None
     ), "Tabelle 'entities' existiert nicht in der Datenbank!"
 
     cur.execute("SELECT COUNT(*) FROM entities")
-    row_count = cur.fetchone()
-    assert row_count is not None, "COUNT-Abfrage hat None zurückgegeben!"
-    assert row_count[0] > 0, "Tabelle 'entities' ist leer!"
-    print(f"Datenbank enthält {row_count[0]:,} Einträge")
+    total_rows = cur.fetchone()[0]
+    assert total_rows > 0, "Tabelle 'entities' ist leer!"
+    print(f"Datenbank enthält {total_rows:,} Einträge gesamt")
 
-    print("Schritt 1: Registriere IDs und sammle Namen")
+    # Rows laden (mit oder ohne Limit)
+    if limit is not None:
+        cur.execute("SELECT id, data FROM entities LIMIT ?", (limit,))
+    else:
+        cur.execute("SELECT id, data FROM entities")
+    rows = cur.fetchall()
+    print(f"Verarbeite {len(rows):,} Einträge\n")
+
+    # ----------------------------------------------------------------
+    # Schritt 1: Entities registrieren mit echten Vektoren
+    # ----------------------------------------------------------------
+    print("Schritt 1: Registriere Entities und berechne Vektoren...")
     full_alias_map = {}
     registered_ids = set()
 
-    for qid, raw_json in cur.execute("SELECT id, data FROM entities"):
+    for i, (qid, raw_json) in enumerate(rows):
 
         assert qid is not None, "qid ist None!"
-        assert isinstance(qid, str), f"qid muss ein String sein, ist aber: {type(qid)}"
         assert raw_json is not None, f"raw_json ist None für qid={qid}!"
-        assert isinstance(
-            raw_json, str
-        ), f"raw_json muss ein String sein für qid={qid}, ist aber: {type(raw_json)}"
-        assert len(raw_json) > 0, f"raw_json ist leer für qid={qid}!"
 
-        # JSON parsen
         try:
             data = json.loads(raw_json)
         except json.JSONDecodeError as e:
-            assert False, f"JSON konnte nicht geparst werden für qid={qid}: {e}"
+            print(f"  WARNUNG: JSON-Fehler für qid={qid}: {e} – übersprungen")
+            continue
 
-        assert isinstance(
-            data, dict
-        ), f"Geparste JSON-Daten sind kein Dict für qid={qid}, ist: {type(data)}"
-        assert "id" in data, f"Kein 'id'-Feld in den Daten für qid={qid}!"
-        assert data["id"] == qid, f"ID-Mismatch: DB-ID={qid}, JSON-ID={data['id']}"
-
-        # Entity registrieren
+        # Entity mit echtem Vektor registrieren
         if qid not in registered_ids:
-            kb.add_entity(entity=qid, entity_vector=[0.0] * 768, freq=3)
+            label = get_label(data, qid)
+            vector = compute_vector(nlp, label)
+            kb.add_entity(entity=qid, entity_vector=vector, freq=3)
             registered_ids.add(qid)
 
-        assert (
-            qid in registered_ids
-        ), f"qid={qid} wurde nicht korrekt in registered_ids eingetragen!"
-
-        # Namen extrahieren
+        # Namen und Aliases sammeln
         names = set()
-
         labels_data = data.get("labels", {})
-        assert isinstance(
-            labels_data, dict
-        ), f"'labels' ist kein Dict für qid={qid}, ist: {type(labels_data)}"
-
         aliases_data = data.get("aliases", {})
-        assert isinstance(
-            aliases_data, dict
-        ), f"'aliases' ist kein Dict für qid={qid}, ist: {type(aliases_data)}"
 
         for lang in ["de", "en"]:
-            assert isinstance(
-                lang, str
-            ), f"lang muss ein String sein, ist aber: {type(lang)}"
-
             label_data = labels_data.get(lang)
-
             if isinstance(label_data, dict):
                 label = label_data.get("value")
             elif isinstance(label_data, str):
@@ -115,138 +128,84 @@ def build_kb(database, outputPath):
             else:
                 label = None
 
-            if label is not None:
-                assert isinstance(
-                    label, str
-                ), f"Label muss ein String sein für qid={qid}, lang={lang}, ist: {type(label)}"
-                assert (
-                    len(label.strip()) > 0
-                ), f"Label ist ein leerer String für qid={qid}, lang={lang}!"
+            if label and label.strip():
                 names.add(label)
 
-            # Aliases – jetzt korrekt innerhalb der for-lang-Schleife
-            alias_list = aliases_data.get(lang, [])
-            assert isinstance(
-                alias_list, list
-            ), f"Alias-Liste ist kein List für qid={qid}, lang={lang}, ist: {type(alias_list)}"
-
-            for entry in alias_list:
-                assert (
-                    entry is not None
-                ), f"Alias-Eintrag ist None für qid={qid}, lang={lang}!"
-
+            for entry in aliases_data.get(lang, []):
                 if isinstance(entry, dict):
                     val = entry.get("value")
                 elif isinstance(entry, str):
                     val = entry
                 else:
                     val = None
-
-                if val is not None:
-                    assert isinstance(
-                        val, str
-                    ), f"Alias-Wert muss ein String sein für qid={qid}, ist: {type(val)}"
-                    assert (
-                        len(val.strip()) > 0
-                    ), f"Alias-Wert ist ein leerer String für qid={qid}, lang={lang}!"
+                if val and val.strip():
                     names.add(val)
 
         # Alias-Map befüllen
-        for n in names:
-            assert n is not None, f"Name in names-Set ist None für qid={qid}!"
-            assert isinstance(
-                n, str
-            ), f"Name muss ein String sein für qid={qid}, ist: {type(n)}"
-            assert len(n.strip()) > 0, f"Name ist ein leerer String für qid={qid}!"
+        for name in names:
+            if name not in full_alias_map:
+                full_alias_map[name] = []
+            if qid not in full_alias_map[name] and len(full_alias_map[name]) < 30:
+                full_alias_map[name].append(qid)
 
-            if n not in full_alias_map:
-                full_alias_map[n] = []
-
-            assert isinstance(
-                full_alias_map[n], list
-            ), f"Alias-Map-Eintrag ist keine Liste für name='{n}'!"
-
-            if qid not in full_alias_map[n] and len(full_alias_map[n]) < 30:
-                full_alias_map[n].append(qid)
+        # Fortschritt
+        if (i + 1) % 500 == 0:
+            print(f"  {i + 1:,} / {len(rows):,} verarbeitet...")
 
     assert len(registered_ids) > 0, "Keine Entitäten wurden registriert!"
     assert len(full_alias_map) > 0, "Alias-Map ist leer – keine Namen gefunden!"
-    print(f"Registrierte Entitäten: {len(registered_ids):,}")
+    print(f"  -> {len(registered_ids):,} Entities registriert")
 
-    print(f"Schritt 2: Schreibe {len(full_alias_map):,} Aliase in die KB")
+    # ----------------------------------------------------------------
+    # Schritt 2: Aliases in KB schreiben
+    # ----------------------------------------------------------------
+    print(f"\nSchritt 2: Schreibe {len(full_alias_map):,} Aliases in die KB...")
 
     for name, qid_list in full_alias_map.items():
-        assert name is not None, "Name in full_alias_map ist None!"
-        assert isinstance(
-            name, str
-        ), f"Name muss ein String sein, ist aber: {type(name)}"
-        assert len(name.strip()) > 0, f"Name in full_alias_map ist ein leerer String!"
-        assert qid_list is not None, f"qid_list ist None für name='{name}'!"
-        assert isinstance(
-            qid_list, list
-        ), f"qid_list ist keine Liste für name='{name}'!"
         assert len(qid_list) > 0, f"qid_list ist leer für name='{name}'!"
-        assert (
-            len(qid_list) <= 30
-        ), f"qid_list überschreitet Limit von 30 für name='{name}': {len(qid_list)}"
 
-        for qid in qid_list:
-            assert qid is not None, f"qid in qid_list ist None für name='{name}'!"
-            assert isinstance(
-                qid, str
-            ), f"qid muss ein String sein für name='{name}', ist: {type(qid)}"
-            assert (
-                qid in registered_ids
-            ), f"qid='{qid}' in Alias-Map ist nicht in registered_ids! (name='{name}')"
+        # Nur registrierte IDs verwenden
+        valid_qids = [q for q in qid_list if q in registered_ids]
+        if not valid_qids:
+            continue
 
-        probs = [1.0 / len(qid_list)] * len(qid_list)
+        probs = [1.0 / len(valid_qids)] * len(valid_qids)
+        kb.add_alias(alias=name, entities=valid_qids, probabilities=probs)
 
-        assert len(probs) == len(
-            qid_list
-        ), f"Länge von probs ({len(probs)}) stimmt nicht mit qid_list ({len(qid_list)}) überein!"
-        assert (
-            abs(sum(probs) - 1.0) < 1e-6
-        ), f"Wahrscheinlichkeiten summieren sich nicht zu 1.0 für name='{name}': {sum(probs)}"
-        for p in probs:
-            assert (
-                0.0 < p <= 1.0
-            ), f"Wahrscheinlichkeit ausserhalb [0,1] für name='{name}': {p}"
+    # ----------------------------------------------------------------
+    # KB speichern
+    # ----------------------------------------------------------------
+    output_dir = os.path.dirname(output_path)
+    if output_dir and not os.path.isdir(output_dir):
+        os.makedirs(output_dir)
 
-        kb.add_alias(alias=name, entities=qid_list, probabilities=probs)
-
-    # Ausgabepfad vorbereiten und KB speichern
-    output_dir = os.path.dirname(KB_OUTPUT_PATH)
-    if output_dir:
-        assert os.path.isdir(
-            output_dir
-        ), f"Ausgabeverzeichnis existiert nicht: {output_dir}"
-
-    kb.to_disk(KB_OUTPUT_PATH)
-
-    assert os.path.exists(
-        KB_OUTPUT_PATH
-    ), f"KB-Datei wurde nicht erstellt unter: {KB_OUTPUT_PATH}!"
+    kb.to_disk(output_path)
+    assert os.path.exists(output_path), f"KB-Datei wurde nicht erstellt: {output_path}"
 
     conn.close()
     print(
-        f"Fertig! {len(registered_ids):,} Entitäten in KB gespeichert unter: {KB_OUTPUT_PATH}"
+        f"\nFertig! {len(registered_ids):,} Entities gespeichert unter: {output_path}"
     )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("-d", "--database")
-    parser.add_argument("-o", "--outputPath")
+    parser.add_argument(
+        "-d", "--database", required=True, help="Pfad zur SQLite-Datenbank"
+    )
+    parser.add_argument(
+        "-o", "--outputPath", required=True, help="Ausgabepfad für die KB"
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Vollständiger Durchlauf ohne Limit (für Ubelix). Standard: LOCAL_TEST_LIMIT",
+    )
     args = parser.parse_args()
 
-    assert (
-        args.database is not None
-    ), "Kein Datenbankpfad angegeben! Bitte -d verwenden."
-    assert (
-        args.outputPath is not None
-    ), "Kein Ausgabepfad angegeben! Bitte -o verwenden."
+    limit = None if args.full else LOCAL_TEST_LIMIT
 
     if os.path.isfile(args.database):
-        build_kb(args.database, args.outputPath)
+        build_kb(args.database, args.outputPath, limit=limit)
     else:
         print(f"Datenbankpfad nicht gefunden: {args.database}")
